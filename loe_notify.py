@@ -15,6 +15,8 @@
   LOE_GROUP           — ваша група/підчерга, напр. "1.1". Порожньо = всі групи.
   SEND_IMAGE          — "1" (типово) надсилати картинку графіка, "0" — лише текст
   STATE_FILE          — файл стану (типово state.json поруч зі скриптом)
+  WARN_MINUTES        — за скільки хвилин до відключення попереджати (типово 30, "0" — вимкнути).
+                        Працює лише коли задано LOE_GROUP.
 
 Запуск:
   python loe_notify.py          — одна перевірка (для cron / GitHub Actions)
@@ -22,6 +24,7 @@
   python loe_notify.py --test   — надіслати тестове повідомлення з поточним графіком
 """
 
+import datetime as dt
 import hashlib
 import html
 import json
@@ -44,6 +47,23 @@ CHECK_INTERVAL_SEC = 600
 
 GROUP_RE = re.compile(r"Груп[аи]\s*(\d+\.\d+)\s*\.?\s*(.*)", re.IGNORECASE)
 DATE_RE = re.compile(r"(\d{2}\.\d{2}\.\d{4})")
+INTERVAL_RE = re.compile(r"з\s*(\d{1,2}):(\d{2})\s*до\s*(\d{1,2}):(\d{2})", re.IGNORECASE)
+
+
+def _kyiv_tz():
+    try:
+        from zoneinfo import ZoneInfo
+        for name in ("Europe/Kyiv", "Europe/Kiev"):
+            try:
+                return ZoneInfo(name)
+            except Exception:  # noqa: BLE001
+                pass
+    except ImportError:
+        pass
+    return dt.timezone(dt.timedelta(hours=2))
+
+
+KYIV = _kyiv_tz()
 
 
 # ---------------------------------------------------------------- HTTP ----
@@ -186,6 +206,68 @@ def build_message(parsed, group, is_new):
     return "\n".join(out)
 
 
+# ---------------------------------------------------------- warnings ----
+
+def outage_intervals(parsed_items, group):
+    """Усі відключення групи як [(початок, кінець)] у київському часі.
+    Суміжні відрізки (напр. 20:00–24:00 і завтра 00:00–04:00) зливаються в один."""
+    raw = []
+    for p in parsed_items:
+        line = p["groups"].get(group) or ""
+        if not p["date"] or not line:
+            continue
+        try:
+            day = dt.datetime.strptime(p["date"], "%d.%m.%Y").replace(tzinfo=KYIV)
+        except ValueError:
+            continue
+        for h1, m1, h2, m2 in INTERVAL_RE.findall(line):
+            start = day + dt.timedelta(hours=int(h1), minutes=int(m1))
+            end = day + dt.timedelta(hours=int(h2), minutes=int(m2))  # 24:00 → наступна доба
+            if end > start:
+                raw.append((start, end))
+    raw.sort()
+    merged = []
+    for s, e in raw:
+        if merged and s <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+        else:
+            merged.append((s, e))
+    return merged
+
+
+def fmt_hm(t, day_start):
+    """24:00 замість 00:00 наступного дня, якщо так читається природніше."""
+    if t.hour == 0 and t.minute == 0 and t.date() > day_start.date():
+        return "24:00"
+    if t.date() > day_start.date():
+        return t.strftime("%H:%M") + " (завтра)"
+    return t.strftime("%H:%M")
+
+
+def check_warnings(cfg, parsed_items, state, now=None):
+    """Надсилає попередження за WARN_MINUTES до початку відключення. Повертає True, якщо щось надіслано."""
+    lead = cfg["warn_minutes"]
+    if not cfg["group"] or lead <= 0:
+        return False
+    now = now or dt.datetime.now(KYIV)
+    warned = state.setdefault("_warned", {})
+    sent = False
+    for start, end in outage_intervals(parsed_items, cfg["group"]):
+        mins_left = (start - now).total_seconds() / 60
+        key = start.strftime("%Y-%m-%d %H:%M")
+        if not (0 < mins_left <= lead) or key in warned:
+            continue
+        mins = max(1, round(mins_left))
+        text = (f"⚠️ <b>Через {mins} хв вимкнуть світло</b>\n\n"
+                f"Група {cfg['group']}: з {start.strftime('%H:%M')} до {fmt_hm(end, start)}\n"
+                "Заряди телефон, павербанк і ноутбук 🔋")
+        tg_notify(cfg["token"], cfg["chat_id"], text)
+        print(f"[ok] попередження про {key} надіслано")
+        warned[key] = now.strftime("%Y-%m-%d %H:%M")
+        sent = True
+    return sent
+
+
 # ------------------------------------------------------------- state ----
 
 def load_state(path):
@@ -196,9 +278,15 @@ def load_state(path):
 
 
 def save_state(path, state):
-    # залишаємо лише останні 10 записів
+    warned = state.pop("_warned", {})
+    # графіки: залишаємо лише останні 10 записів
     keys = list(state.keys())[-10:]
     state = {k: state[k] for k in keys}
+    # попередження: лише за останні 3 доби
+    cutoff = (dt.datetime.now(KYIV) - dt.timedelta(days=3)).strftime("%Y-%m-%d")
+    warned = {k: v for k, v in warned.items() if k[:10] >= cutoff}
+    if warned:
+        state["_warned"] = warned
     Path(path).write_text(json.dumps(state, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
 
 
@@ -211,10 +299,12 @@ def check_once(cfg, force=False):
         return
     state = load_state(cfg["state_file"])
     changed = False
+    parsed_items = []
     for item in items:
         p = parse_item(item)
         if not p["groups"] and not p["image"]:
             continue  # порожній пункт — графіка немає
+        parsed_items.append(p)
         key = p["date"] or p["name"] or "unknown"
         fp = fingerprint(p, cfg["group"])
         old = state.get(key)
@@ -226,6 +316,11 @@ def check_once(cfg, force=False):
         print(f"[ok] {key}: надіслано")
         state[key] = fp
         changed = True
+    try:
+        if check_warnings(cfg, parsed_items, state):
+            changed = True
+    except Exception as e:  # noqa: BLE001
+        print(f"[error] попередження: {e}", file=sys.stderr)
     if changed:
         save_state(cfg["state_file"], state)
 
@@ -241,6 +336,7 @@ def main():
         "group": os.environ.get("LOE_GROUP", "").strip(),
         "send_image": os.environ.get("SEND_IMAGE", "1").strip() != "0",
         "state_file": os.environ.get("STATE_FILE") or str(Path(__file__).with_name("state.json")),
+        "warn_minutes": int(os.environ.get("WARN_MINUTES", "30").strip() or "30"),
     }
     if "--test" in sys.argv:
         check_once(cfg, force=True)
