@@ -38,7 +38,7 @@ jobs:
           git add state.json 2>/dev/null || true
           git diff --cached --quiet || (git commit -m "state update" && git push)
 
-    keepalive:
+  keepalive:
     runs-on: ubuntu-latest
     permissions:
       actions: write
